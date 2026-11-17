@@ -1,4 +1,5 @@
-"""FastAPI application: bounded uploads, status, cancellation, downloads."""
+"""FastAPI application: bounded uploads, status, cancellation, downloads,
+and the paired coverage check on succeeded tasks."""
 
 from __future__ import annotations
 
@@ -10,9 +11,9 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from . import config, db, worker
+from . import config, coverage, db, worker
 from .worker import UploadTooLarge, start_worker, task_dir
 
 
@@ -29,7 +30,9 @@ app = FastAPI(
     description=(
         "Upload shuffled paired-end FASTQ files (R1/R2, uncompressed, "
         "max 256 MiB each). The service re-pairs them by read id, delivers "
-        "both mates in R1 order and preserves the original bytes."
+        "both mates in R1 order and preserves the original bytes. "
+        "Succeeded tasks can be checked for low-coverage intervals against "
+        "a single ACGT reference sequence."
     ),
     lifespan=lifespan,
 )
@@ -232,3 +235,96 @@ def download_r2(task_id: str) -> FileResponse:
 @app.get("/health")
 def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+class CoverageCheckRequest(BaseModel):
+    reference_fasta: str = Field(
+        ...,
+        max_length=65_536,
+        description=(
+            "Single-sequence FASTA (header line plus ACGT bases, "
+            "at most 10000 bp)."
+        ),
+    )
+    depth_threshold: int = Field(
+        ...,
+        ge=config.COVERAGE_MIN_DEPTH_THRESHOLD,
+        le=config.COVERAGE_MAX_DEPTH_THRESHOLD,
+        description="Bases with depth below this threshold are reported (1-20).",
+    )
+
+
+class CoverageInterval(BaseModel):
+    start: int
+    end: int
+
+
+class CoverageCheckResponse(BaseModel):
+    task_id: str
+    reference_name: str
+    reference_length: int
+    depth_threshold: int
+    pairs_total: int
+    pairs_placed: int
+    pairs_no_placement: int
+    pairs_multiple_placements: int
+    low_coverage_intervals: list[CoverageInterval]
+
+
+def _succeeded_result_paths(task_id: str) -> tuple[Path, Path]:
+    """Resolve the published R1/R2 paths of a succeeded task, read-only."""
+    conn = db.connect()
+    try:
+        row = db.get_task(conn, task_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        if row["status"] != "succeeded":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"task is {row['status']}; the coverage check requires "
+                    "a succeeded task"
+                ),
+            )
+        rels = (row["result_r1"], row["result_r2"])
+    finally:
+        conn.close()
+
+    base = task_dir(task_id).resolve()
+    paths: list[Path] = []
+    for rel in rels:
+        if not rel:
+            raise HTTPException(
+                status_code=500, detail="task result files are missing"
+            )
+        path = (base / rel).resolve()
+        # Same traversal guard as the download endpoints.
+        if base not in path.parents or not path.is_file():
+            raise HTTPException(
+                status_code=500, detail="task result files are missing"
+            )
+        paths.append(path)
+    return paths[0], paths[1]
+
+
+@app.post("/tasks/{task_id}/coverage-check", response_model=CoverageCheckResponse)
+def coverage_check(task_id: str, req: CoverageCheckRequest) -> CoverageCheckResponse:
+    """Check a succeeded task's pairs for low-coverage intervals.
+
+    Both ends of every pair (at most 2000 pairs, 40-100 bp per end) must
+    match the reference exactly. A pair adds depth only when it has exactly
+    one compliant placement (R1 forward, R2 reverse complement, increasing
+    starts, outermost span <= 500 bp); pairs with no or several compliant
+    placements are only counted. Returns below-threshold contiguous
+    intervals as 1-based closed intervals. Any input or result-file error
+    fails the whole check; no partial intervals are returned and the task
+    files are never modified.
+    """
+    r1_path, r2_path = _succeeded_result_paths(task_id)
+    try:
+        report = coverage.check_pair_coverage(
+            r1_path, r2_path, req.reference_fasta, req.depth_threshold
+        )
+    except coverage.CoverageInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return CoverageCheckResponse(task_id=task_id, **report)

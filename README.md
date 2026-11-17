@@ -21,6 +21,47 @@
 - 格式错误：非四行式、头行不以 `@` 开头、第三行不以 `+` 开头、空文件
 - 序列与质量字符串长度不等
 
+## 配对覆盖核查（靶向测序低覆盖区段）
+
+`POST /tasks/{id}/coverage-check` 对**已成功**任务的配对结果做覆盖核查，
+找出需要补测的低覆盖区段。请求体：
+
+```json
+{
+  "reference_fasta": ">panel-1\nACGT...(单条 ACGT 序列, ≤ 10000 bp)",
+  "depth_threshold": 5
+}
+```
+
+- 参考序列：单条 FASTA，仅 ACGT（大小写均可，可多行换行），长度 1–10000
+  碱基；深度阈值：整数 1–20。
+- 处理上限：**至多 2000 对**读对，每端 **40–100 碱基**；超限整次报错（422）。
+- 定位规则：两端必须与参考正向或反向互补片段**完全一致**。仅当读对
+  **恰有一组**「左端（R1）正向、右端（R2）反向互补、起点递增、两端最外侧
+  覆盖跨度 ≤ 500 碱基」的定位时，该读对才计入深度：两端各自覆盖的碱基
+  +1，重叠处累加两次。无合规定位、多组定位的读对分别计数、不计深度。
+- 返回：参考序列上低于阈值的连续区间（**1 基闭区间**）及三类读对数：
+
+```json
+{
+  "task_id": "…", "reference_name": "panel-1", "reference_length": 10000,
+  "depth_threshold": 5,
+  "pairs_total": 2000, "pairs_placed": 1873,
+  "pairs_no_placement": 101, "pairs_multiple_placements": 26,
+  "low_coverage_intervals": [{"start": 418, "end": 763}]
+}
+```
+
+- **整次报错，不返回部分区间**：双端读号不一致、FASTQ 结构错误、序列与
+  质量长度不等、参考序列非法、阈值越界、读长越界、读对数超限 → 422；
+  任务不存在 → 404；任务未成功 → 409；结果缺件 → 500。核查全程只读
+  结果文件，不改原文件、不写数据库。
+- 重复序列性能：匹配位置按不同读段序列缓存（int32 数组，总额 ≤ 100 万
+  个位置 ≈ 4 MiB），定位搜索找到 2 组即提前退出，候选组合再多也不会
+  物化或卡住；实测 10000 bp 纯合重复参考 + 2000 对重复读段约 0.6 s 完成，
+  峰值 RSS 增量约 2.6 MiB，远在 256 MiB 内存上限内。
+
+
 ## 内存与大输入
 
 - 上传经 `SpooledTemporaryFile` 落盘（超过 1 MiB 即写临时文件），分块复制，
@@ -55,6 +96,7 @@
 | POST | `/tasks/{id}/cancel` | 请求取消（立即返回） |
 | GET  | `/tasks/{id}/download/r1` | 下载配对后的 R1 |
 | GET  | `/tasks/{id}/download/r2` | 下载配对后的 R2 |
+| POST | `/tasks/{id}/coverage-check` | 配对覆盖核查：低覆盖区间 + 三类读对数 |
 | GET  | `/health` | 健康检查 |
 
 启动后打开交互式文档：<http://localhost:8000/docs>，可直接在页面上演示
@@ -93,10 +135,11 @@ BASE_URL=http://localhost:8000 ./scripts/demo.sh
 ## 自测
 
 ```bash
-# 短测试（功能/取消/重启语义 + 取消与完成的仲裁），共 39 项检查
+# 短测试（功能/取消/重启语义 + 覆盖核查 + 取消与完成的仲裁）
 bash scripts/run_tests.sh
 # 或分别运行
 .venv/bin/python -I tests/test_api.py          # 30 项：配对、整次失败、取消、重启恢复
+.venv/bin/python -I tests/test_coverage.py     # 37 项：覆盖核查定位/深度/区间/报错/重复序列压力
 .venv/bin/python -I tests/test_cancel_race.py  # 9 项：取消/完成条件 UPDATE 仲裁
 
 # 内存压力测试：两份各 196.5 MiB（合计约 393 MiB，超过 256 MiB 内存上限），
@@ -112,8 +155,9 @@ app/
   db.py        # SQLite schema 与任务/记录访问
   fastq.py     # 流式解析、校验、JOIN 配对发布
   worker.py    # 后台线程、取消仲裁、启动恢复、任务目录清理
+  coverage.py  # 配对覆盖核查：FASTA 校验、定位、深度与低覆盖区间
   main.py      # FastAPI 路由与有界流式上传
-tests/         # 功能自测与内存压力测试
+tests/         # 功能自测、覆盖核查自测与内存压力测试
 scripts/demo.sh
 Dockerfile, docker-compose.yml, requirements.txt
 ```

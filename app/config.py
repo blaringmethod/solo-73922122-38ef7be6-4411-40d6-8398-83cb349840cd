@@ -41,3 +41,28 @@ STAGE_PARSE = "parse"
 STAGE_VALIDATE = "validate"
 STAGE_PUBLISH = "publish"
 STAGE_DONE = "done"
+
+# ---- Pair coverage check (see app/coverage.py) ----
+COVERAGE_MAX_REFERENCE_BASES = int(
+    os.environ.get("FASTQ_COVERAGE_MAX_REFERENCE_BASES", 10_000)
+)
+"""Maximum length of the single ACGT reference sequence (10,000 bp)."""
+
+COVERAGE_MAX_PAIRS = int(os.environ.get("FASTQ_COVERAGE_MAX_PAIRS", 2_000))
+"""Maximum number of read pairs one coverage check may process."""
+
+COVERAGE_MIN_READ_BASES = int(os.environ.get("FASTQ_COVERAGE_MIN_READ_BASES", 40))
+COVERAGE_MAX_READ_BASES = int(os.environ.get("FASTQ_COVERAGE_MAX_READ_BASES", 100))
+"""Accepted per-end read length range (40-100 bp)."""
+
+COVERAGE_MAX_SPAN = int(os.environ.get("FASTQ_COVERAGE_MAX_SPAN", 500))
+"""Maximum outermost covered span of a compliant pair placement (500 bp)."""
+
+COVERAGE_MIN_DEPTH_THRESHOLD = 1
+COVERAGE_MAX_DEPTH_THRESHOLD = 20
+"""Accepted depth-threshold range (1-20)."""
+
+COVERAGE_CACHE_POSITIONS = int(
+    os.environ.get("FASTQ_COVERAGE_CACHE_POSITIONS", 1_000_000)
+)
+"""Budget of cached match positions (int32, 1M entries = 4 MiB)."""
